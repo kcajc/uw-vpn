@@ -27,7 +27,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         _ = try? Config.load()
         refreshMenu()
     }
@@ -44,11 +44,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func refreshMenu() {
         let connected = status == "Connected"
-        item.button?.title = " UW"
-        item.button?.image = NSImage(systemSymbolName: connected ? "lock.shield.fill" : "network",
-                                     accessibilityDescription: "UW VPN — \(status)")
-        item.button?.imagePosition = .imageLeading
-        item.button?.contentTintColor = connected ? .systemGreen : (attempt == nil ? .labelColor : .systemOrange)
+        let image = NSImage(systemSymbolName: connected ? "lock.shield" : "shield.slash",
+                            accessibilityDescription: "UW VPN — \(status)")?
+            .withSymbolConfiguration(.init(pointSize: 16, weight: .regular))
+        image?.isTemplate = true // AppKit supplies the menu bar's contrast and highlight colors.
+        item.button?.title = ""
+        item.button?.image = image
+        item.button?.imagePosition = .imageOnly
+        item.button?.contentTintColor = nil
+        item.button?.toolTip = "UW VPN — \(status)"
         let menu = NSMenu()
         menu.autoenablesItems = false
         let label = menu.addItem(withTitle: "UW VPN — \(status)", action: nil, keyEquivalent: "")

@@ -4,6 +4,10 @@ A small native macOS menu bar wrapper around the Homebrew OpenConnect you alread
 have. Connect, disconnect, edit a JSON file, save a password in the login Keychain.
 No third-party GUI framework or downloaded app code.
 
+The menu bar uses a monochrome SF Symbol: `lock.shield` when connected and
+`shield.slash` otherwise. AppKit chooses its contrast against the menu bar;
+connection status is also available in the tooltip and menu.
+
 Requires an Apple Silicon Mac running macOS 13+, Xcode Command Line Tools, and:
 
 ```sh

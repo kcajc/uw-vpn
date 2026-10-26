@@ -40,8 +40,8 @@ does not alter an active connection. Passwords do not belong in this file.
 Homebrew's `/opt/homebrew/bin/openconnect` and
 `/opt/homebrew/etc/vpnc/vpnc-script` are explicit constants in `Core.swift`.
 
-Choose **Connect**, approve the standard macOS administrator dialog when it
-appears, enter your WatIAM password in the app's secure field on first use, and
+Choose **Connect**, approve Touch ID (or the macOS administrator password dialog
+if Touch ID is unavailable or unsuccessful), enter your WatIAM password in the app's secure field on first use, and
 approve Duo on your phone. Subsequent connects use the saved password. The
 macOS administrator password is handled by macOS, never by this app. You may
 still get Keychain authorization/unlock prompts under your local Keychain policy.
@@ -53,9 +53,14 @@ redacted, and held only in memory. There is no launch-at-login or auto-connect.
 
 ## What runs with privilege
 
-1. The app launches the bundled `uw-vpn-runner` with `osascript`'s standard
-   `with administrator privileges` dialog. The AppleScript contains executable
-   and socket paths plus your local UID; it contains no password or cookie.
+1. The app first launches the bundled `uw-vpn-runner` using `/usr/bin/sudo -k -S`
+   with stdin connected to `/dev/null`. On Macs with Apple's `pam_tid` enabled
+   for sudo, this offers Touch ID; it cannot collect a password from the app.
+   It deliberately avoids `sudo -A`, which disables Touch ID in Apple's PAM module.
+   If this attempt fails before a runner connects, the app falls back once to
+   `osascript`'s standard `with administrator privileges` dialog. Its AppleScript
+   contains executable and socket paths plus your local UID, with no password or
+   cookie. Cancelling the connection in the app suppresses the fallback.
 2. The runner connects to a fresh Unix socket in a random 0700 directory, with
    a 0600 socket. The app checks that its peer is root; the runner checks the
    user's UID. Authentication starts only after this handshake.
@@ -73,7 +78,9 @@ redacted, and held only in memory. There is no launch-at-login or auto-connect.
    child, waits for its cleanup, then ends the runner. It never uses `killall`.
 
 No sudoers edits, root service installation, or automatic login retry loop. A new
-connection can ask for administrator approval. OpenConnect retries a network
+connection asks for administrator approval. Touch ID uses your existing sudo PAM
+policy; the app does not edit it. Macs without `pam_tid` use the password dialog.
+OpenConnect retries a network
 outage for `reconnectTimeout` seconds; Waterloo's session lifetime and MFA rules
 still apply. The green icon follows OpenConnect's tunnel-configuration messages;
 it is not an independent campus reachability probe.
@@ -112,16 +119,21 @@ failure, malformed sessions, and cleanup completion. `--ui` additionally creates
 the native menu bar item and checks that it is on screen, without authenticating.
 
 Verified locally on 2026-10-26: release build and code signature validation,
-33 core checks, six integration scenarios, and the native menu bar smoke test.
+42 core checks, six integration scenarios, and the native menu bar smoke test.
 The user completed a real WatIAM/Keychain/Duo login and confirmed Connected.
 Waterloo's `checkvpn.uwaterloo.ca` independently reported campus connectivity;
 the advertised Waterloo route used the tunnel while a public Internet destination
 still used `en0`. Gateway-provided Waterloo DNS servers were installed as both
 default and supplemental resolvers; DNS is not restricted to Waterloo queries.
 
-Live disconnect/DNS restoration, a second login using the saved password, and
-sleep/wake have not yet been verified. The cleanup and EOF tests above used a
-fake tunnel; they are not proof of live network cleanup.
+The user also confirmed the updated Touch ID-first connection flow on 2026-10-26.
+Between the earlier and updated sessions, the campus route and Waterloo DNS
+entries were absent and the local DNS servers were restored. Sleep/wake remains
+untested; the controlled disconnect and EOF integration scenarios use a fake
+tunnel. The one-time password fallback has automated decision checks; a forced
+Touch ID failure followed by the fallback dialog has not been tested live.
 
 Protocol references: [OpenConnect manual](https://www.infradead.org/openconnect/manual.html),
 [separating authentication from tunnel privilege](https://www.infradead.org/openconnect/nonroot.html).
+Apple's [Touch ID PAM implementation](https://github.com/apple-oss-distributions/pam_modules/blob/main/modules/pam_tid/pam_tid.c)
+documents the Aqua session requirement and the askpass exclusion.

@@ -153,6 +153,22 @@ func shellQuote(_ value: String) -> String {
     "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
 }
 
+enum AuthorizationMethod {
+    case touchID, password
+
+    func needsPasswordFallback(exitCode: Int32, runnerStarted: Bool, cancelled: Bool) -> Bool {
+        self == .touchID && exitCode != 0 && !runnerStarted && !cancelled
+    }
+}
+
+func touchIDArguments(runner: String, socket: String, uid: UInt32) -> [String] {
+    // -S permits a GUI process without a terminal, while still using pam_tid.
+    // stdin is /dev/null: password authentication cannot happen on this path.
+    // Do not use -A: Apple's pam_tid explicitly skips Touch ID in askpass mode.
+    // -k ignores cached sudo credentials for this invocation.
+    ["-k", "-S", "-p", "", "--", runner, socket, String(uid)]
+}
+
 func authorizationScript(runner: String, socket: String, uid: UInt32) -> String {
     let command = "exec \(shellQuote(runner)) \(shellQuote(socket)) \(uid)"
     let escaped = command.replacingOccurrences(of: "\\", with: "\\\\")

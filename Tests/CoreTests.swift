@@ -61,6 +61,16 @@ enum Tests {
         var appleScriptError: NSDictionary?
         check(NSAppleScript(source: script)!.compileAndReturnError(&appleScriptError), "authorization AppleScript compiles without running")
         check(shellQuote("a'b") == "'a'\\''b'", "shell quoting")
+        let touchID = touchIDArguments(runner: "/path with 'quotes'/runner", socket: "/tmp/control", uid: 501)
+        check(touchID.contains("-S") && !touchID.contains("-A"), "Touch ID uses PAM without askpass")
+        check(touchID.contains("-k"), "Touch ID does not borrow cached sudo authentication")
+        check(touchID.suffix(3) == ["/path with 'quotes'/runner", "/tmp/control", "501"], "runner arguments passed directly without shell parsing")
+        check(!touchID.joined().contains(session.cookie), "biometric launch has no credentials")
+        check(AuthorizationMethod.touchID.needsPasswordFallback(exitCode: 1, runnerStarted: false, cancelled: false), "failed biometrics permits password fallback")
+        check(!AuthorizationMethod.touchID.needsPasswordFallback(exitCode: 0, runnerStarted: false, cancelled: false), "successful biometrics does not request password")
+        check(!AuthorizationMethod.touchID.needsPasswordFallback(exitCode: 1, runnerStarted: true, cancelled: false), "no second runner after first runner starts")
+        check(!AuthorizationMethod.touchID.needsPasswordFallback(exitCode: 1, runnerStarted: false, cancelled: true), "cancelling the connection suppresses fallback")
+        check(!AuthorizationMethod.password.needsPasswordFallback(exitCode: 1, runnerStarted: false, cancelled: false), "password fallback cannot retry itself")
 
         let listener = try Listener()
         var info = stat()

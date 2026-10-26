@@ -175,31 +175,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func authorize(_ current: Attempt) throws {
+    private func authorize(_ current: Attempt, method: AuthorizationMethod = .touchID) throws {
         let runner = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/uw-vpn-runner").path
-        let process = Process(), input = Pipe(), errors = Capture()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.standardInput = input
+        let process = Process(), errors = Capture()
+        let input: Pipe?
+        if method == .touchID {
+            log("Trying macOS sudo Touch ID authentication.")
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+            process.arguments = touchIDArguments(runner: runner, socket: current.listener.path, uid: getuid())
+            process.standardInput = FileHandle.nullDevice
+            input = nil
+        } else {
+            log("Using the standard macOS administrator dialog as fallback.")
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            input = Pipe()
+            process.standardInput = input
+        }
         process.standardOutput = FileHandle.nullDevice
         process.standardError = errors.pipe
         current.authorizer = process
         process.terminationHandler = { [weak self] process in
             let detail = errors.result()
+            process.terminationHandler = nil
             Task { @MainActor in
-                guard let self, self.attempt?.id == current.id else { return }
+                guard let self, self.attempt?.id == current.id, current.authorizer === process else { return }
                 if current.stopping { self.finish(current.id) }
+                else if method.needsPasswordFallback(exitCode: process.terminationStatus,
+                                                     runnerStarted: current.channel != nil, cancelled: current.stopping) {
+                    do { try self.authorize(current, method: .password) }
+                    catch { self.fail(current.id, error.localizedDescription) }
+                }
                 else if process.terminationStatus != 0 {
                     self.fail(current.id, "Administrator authorization or tunnel runner failed.\n\(sanitized(detail))")
                 }
             }
         }
         do { try process.run() }
-        catch { errors.closeWriter(); throw error }
+        catch {
+            process.terminationHandler = nil
+            errors.closeWriter()
+            if method == .touchID { try authorize(current, method: .password); return }
+            throw error
+        }
         errors.closeWriter()
-        input.fileHandleForReading.closeFile()
-        try input.fileHandleForWriting.write(contentsOf:
-            Data(authorizationScript(runner: runner, socket: current.listener.path, uid: getuid()).utf8))
-        input.fileHandleForWriting.closeFile()
+        if let input {
+            input.fileHandleForReading.closeFile()
+            try input.fileHandleForWriting.write(contentsOf:
+                Data(authorizationScript(runner: runner, socket: current.listener.path, uid: getuid()).utf8))
+            input.fileHandleForWriting.closeFile()
+        }
     }
 
     private func waitForRunner(_ current: Attempt) {

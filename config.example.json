@@ -1,0 +1,7 @@
+{
+  "server": "https://vpn.uwaterloo.ca",
+  "authgroup": "UW-General-Campus",
+  "username": "",
+  "duo": "push",
+  "reconnectTimeout": 3600
+}

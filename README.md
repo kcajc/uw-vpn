@@ -111,9 +111,17 @@ root. Tests cover disconnect, GUI EOF/crash, pre-auth cancellation, natural chil
 failure, malformed sessions, and cleanup completion. `--ui` additionally creates
 the native menu bar item and checks that it is on screen, without authenticating.
 
-Live Waterloo authentication, campus reachability, split routing/DNS, sleep/wake,
-and teardown require a user-approved login test. A passing fake-tunnel test is
-not evidence that those live behaviors work.
+Verified locally on 2026-10-26: release build and code signature validation,
+33 core checks, six integration scenarios, and the native menu bar smoke test.
+The user completed a real WatIAM/Keychain/Duo login and confirmed Connected.
+Waterloo's `checkvpn.uwaterloo.ca` independently reported campus connectivity;
+the advertised Waterloo route used the tunnel while a public Internet destination
+still used `en0`. Gateway-provided Waterloo DNS servers were installed as both
+default and supplemental resolvers; DNS is not restricted to Waterloo queries.
+
+Live disconnect/DNS restoration, a second login using the saved password, and
+sleep/wake have not yet been verified. The cleanup and EOF tests above used a
+fake tunnel; they are not proof of live network cleanup.
 
 Protocol references: [OpenConnect manual](https://www.infradead.org/openconnect/manual.html),
 [separating authentication from tunnel privilege](https://www.infradead.org/openconnect/nonroot.html).

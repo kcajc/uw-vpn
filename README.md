@@ -4,9 +4,11 @@ A small native macOS menu bar wrapper around the Homebrew OpenConnect you alread
 have. Connect, disconnect, edit a JSON file, save a password in the login Keychain.
 No third-party GUI framework or downloaded app code.
 
-The menu bar uses the paired link SF Symbols: `personalhotspot` when connected and
-`personalhotspot.slash` otherwise. AppKit chooses their contrast against the menu bar;
-connection status is also available in the tooltip and menu.
+The menu bar uses connection-node SF Symbols:
+`point.3.filled.connected.trianglepath.dotted` when connected and
+`point.3.connected.trianglepath.dotted` otherwise. Filled versus outlined nodes
+show connection state. AppKit chooses their contrast against the menu bar;
+status is also available in the tooltip and menu.
 
 Requires an Apple Silicon Mac running macOS 13+, Xcode Command Line Tools, and:
 

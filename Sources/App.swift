@@ -44,9 +44,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func refreshMenu() {
         let connected = status == "Connected"
-        let image = NSImage(systemSymbolName: connected ? "personalhotspot" : "personalhotspot.slash",
+        let symbol = connected
+            ? "point.3.filled.connected.trianglepath.dotted"
+            : "point.3.connected.trianglepath.dotted"
+        let image = NSImage(systemSymbolName: symbol,
                             accessibilityDescription: "UW VPN — \(status)")?
-            .withSymbolConfiguration(.init(pointSize: 16, weight: .regular))
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 16, weight: .regular)
+                .applying(.preferringMonochrome()))
         image?.isTemplate = true // AppKit supplies the menu bar's contrast and highlight colors.
         item.button?.title = ""
         item.button?.image = image

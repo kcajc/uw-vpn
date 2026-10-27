@@ -10,7 +10,7 @@ The menu bar uses connection-node SF Symbols:
 show connection state. AppKit chooses their contrast against the menu bar;
 status is also available in the tooltip and menu.
 
-Requires an Apple Silicon Mac running macOS 13+, Xcode Command Line Tools, and:
+Requires an Apple Silicon Mac running macOS 13+, Xcode 27+ for building, and:
 
 ```sh
 brew install openconnect
@@ -20,11 +20,26 @@ brew install openconnect
 open "$HOME/Applications/UW VPN.app"
 ```
 
-`build.sh` uses only the system Swift compiler and ad-hoc code signing. No package
+`build.sh` uses Apple's Swift compiler, asset compiler, and ad-hoc code signing. No package
 manager, remote build step, developer account, system extension, or persistent
 privileged helper is needed. `test.sh` uses Python 3 to drive a fake tunnel.
 Quit the app before replacing an installed build. An ad-hoc signed rebuild can
 require granting Keychain access again because its code identity changes.
+
+## Application icon
+
+`Resources/AppIcon.icon` is an editable Apple Icon Composer document, started from
+Xcode's bundled macOS Icon Composer template. Its original SVG artwork depicts
+two terminals joined by a tunnel; it does not reuse an SF Symbol. Apple supplies
+the icon mask, glass treatment, and default/dark/tinted appearances. Open the
+document in Icon Composer to edit it. `actool` compiles it into `Assets.car` and
+an `.icns` fallback for older macOS releases; neither tool is needed at runtime.
+On 2026-10-27 the release build, code signature, icon metadata, and compiled
+appearance stacks were checked; macOS returned the new icon for the installed app.
+
+References: [Apple Icon Composer](https://developer.apple.com/icon-composer/),
+[Apple's app icon guidance](https://developer.apple.com/design/human-interface-guidelines/app-icons),
+and [SF Symbols usage guidance](https://developer.apple.com/design/human-interface-guidelines/sf-symbols).
 
 ## Plaintext config
 
@@ -88,7 +103,7 @@ connection asks for administrator approval. Touch ID uses your existing sudo PAM
 policy; the app does not edit it. Macs without `pam_tid` use the password dialog.
 OpenConnect retries a network
 outage for `reconnectTimeout` seconds; Waterloo's session lifetime and MFA rules
-still apply. The green icon follows OpenConnect's tunnel-configuration messages;
+still apply. The connected icon follows OpenConnect's tunnel-configuration messages;
 it is not an independent campus reachability probe.
 
 ## Review map and trust boundary
@@ -101,6 +116,7 @@ it is not an independent campus reachability probe.
 | `Sources/IPC.swift` | Private per-session control channel and peer UID checks |
 | `Sources/Runner.swift` | The complete per-session privileged launcher |
 | `Sources/Capture.swift` | Bounded subprocess output capture |
+| `Resources/AppIcon.icon` | Icon Composer source and original vector artwork |
 
 This app trusts macOS, the local Swift build, and the installed Homebrew
 OpenConnect, its libraries, and `vpnc-script`. Those Homebrew files and the local

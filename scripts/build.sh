@@ -21,14 +21,20 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>UW VPN</string>
   <key>CFBundleIdentifier</key><string>net.kcajc.uw-vpn</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.4</string>
-  <key>CFBundleVersion</key><string>5</string>
+  <key>CFBundleShortVersionString</key><string>0.1.5</string>
+  <key>CFBundleVersion</key><string>6</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleIconName</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST
 cp config.example.json "$app/Contents/Resources/"
+xcrun actool Resources/AppIcon.icon --compile "$app/Contents/Resources" \
+  --platform macosx --minimum-deployment-target 13.0 --target-device mac \
+  --app-icon AppIcon --output-partial-info-plist "$PWD/build/icon-info.plist" \
+  --output-format human-readable-text
 /usr/bin/codesign --force --sign - --identifier net.kcajc.uw-vpn.runner "$app/Contents/MacOS/uw-vpn-runner"
 /usr/bin/codesign --force --sign - "$app"
 /usr/bin/codesign --verify --deep --strict "$app"

@@ -40,12 +40,15 @@ username in `~/.config/uw-vpn/config.json`:
 Choose **Connect**, approve administrator access, enter your WatIAM password on
 first use, and approve Duo on your phone. Later connections reuse the saved
 password. Touch ID uses your existing sudo setup, with a macOS administrator
-password dialog as fallback. The app does not change your sudo configuration.
+password dialog as a fallback. The app does not change your sudo configuration.
 
-The config reloads on each connection. Keep all five keys; `push2`, etc. selects
-another Duo device, and `reconnectTimeout` is in seconds. Use **Set Password…**
+The config reloads on each connection. Keep all five keys. Use `push2`, `push3`,
+etc. to select another Duo device; `reconnectTimeout` is in seconds. Use **Set Password…**
 after changing your password, **Forget Password** to remove the saved credential,
 and **Diagnostics…** if a connection fails.
+
+**Duo Push only.** With iPhone notifications mirrored to your Mac, you can approve
+Duo Push directly from a notification. (I think this is faster than using a YubiKey.)
 
 ## Trust & security
 

@@ -28,6 +28,7 @@ private final class Attempt {
     var authenticator: Process?
     var timer: Timer? // The connection timeout, then the disconnect deadline.
     var stopping = false
+    var overdue = false // Past the disconnect deadline; still waiting for the runner to exit.
     var authenticationStarted = false
     var error: String? // The first failure wins; it is shown when the attempt finishes.
     init(config: Config) throws { self.config = config; listener = try Listener() }
@@ -36,8 +37,12 @@ private final class Attempt {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let connectTimeout: TimeInterval = 180
-    // Longer than the runner's logoff grace (20 s) plus a vpnc-script run.
+    // A normal logoff plus vpnc-script run takes a few seconds.
+    #if UI_TEST
+    private static let disconnectDeadline: TimeInterval = 1
+    #else
     private static let disconnectDeadline: TimeInterval = 45
+    #endif
     private static let timestamp: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
@@ -65,6 +70,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         print("Native menu: \(menu.items.map(\.title).filter { !$0.isEmpty }.joined(separator: ", "))")
         return menu.items.contains { $0.title == "Connect" && $0.isEnabled }
     }
+
+    private(set) var alerts: [String] = []
+    var isIdle: Bool { attempt == nil }
+    var hasRunner: Bool { attempt?.channel != nil }
+    var connectEnabled: Bool { item.menu?.items.first { $0.action == #selector(toggle) }?.isEnabled ?? false }
+    var quitEnabled: Bool { item.menu?.items.first { $0.action == #selector(quit) }?.isEnabled ?? false }
+
+    /// Starts an attempt without sudo and returns the "runner" end of its control socket. The test
+    /// decides what the runner does; staying silent simulates a stuck OpenConnect cleanup.
+    func startAttemptWithFakeRunner() throws -> Channel {
+        let current = try Attempt(config: Config())
+        attempt = current
+        setState(.authorizing)
+        waitForRunner(current)
+        return try Channel.connect(path: current.listener.path)
+    }
+    func requestDisconnect() { stop() }
     #endif
 
     private func setState(_ new: ConnectionState) {
@@ -122,17 +144,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func alert(_ message: String) {
+        #if UI_TEST
+        alerts.append(message) // Recorded for the test instead of blocking on a modal alert.
+        #else
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "UW VPN"
         alert.informativeText = message
         alert.runModal()
+        #endif
     }
 
-    private func schedule(_ interval: TimeInterval, _ body: @escaping @MainActor () -> Void) -> Timer {
-        Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { _ in
-            Task { @MainActor in body() }
-        }
+    /// A one-shot main-thread timer. `allModes` lets it fire while AppKit runs a modal loop, which it
+    /// does while waiting to quit: a default-mode timer would never fire there, so Quit would hang.
+    /// The body runs directly on the main thread rather than hopping through the main queue, which
+    /// AppKit does not drain while a quit is pending if the quit began inside a main-queue block.
+    private func schedule(_ interval: TimeInterval, allModes: Bool = false,
+                          _ body: @escaping @MainActor () -> Void) -> Timer {
+        let timer = Timer(timeInterval: interval, repeats: false) { _ in MainActor.assumeIsolated(body) }
+        RunLoop.main.add(timer, forMode: allModes ? .common : .default)
+        return timer
     }
 
     private func config() throws -> Config {
@@ -212,6 +243,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             diagnostics.removeAll()
             setState(.authorizing)
             log("Authorizing a per-session tunnel runner. No persistent helper or sudoers rule.")
+            // Default mode only: this must not fire behind the modal password dialog.
             current.timer = schedule(Self.connectTimeout) { [weak self] in
                 self?.fail(current.id, "Connection timed out. No automatic login retries were made.")
             }
@@ -342,9 +374,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             current.authenticator = process
             process.terminationHandler = { [weak self] process in
                 let succeeded = process.terminationReason == .exit && process.terminationStatus == 0
-                let session = Result { try Session(output: output.result(), config: config) }
-                let cookie = (try? session.get())?.cookie ?? ""
-                let detail = sanitized(errors.result(), secrets: [password, cookie])
+                let stdout = output.result()
+                let session = Result { try Session(output: stdout, config: config) }
+                // Found even when the session is rejected, so stderr can never echo it into Diagnostics.
+                let detail = sanitized(errors.result(), secrets: [password] + Session.cookies(in: stdout))
                 process.terminationHandler = nil
                 Task { @MainActor in
                     guard let self, self.attempt?.id == current.id, !current.stopping else { return }
@@ -385,14 +418,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let process = current.authenticator, process.isRunning { process.interrupt() }
         if let channel = current.channel {
             try? channel.send(.stop)
-            // A stuck OpenConnect cleanup must never trap the app (or a logout) in "Disconnecting…".
-            current.timer = schedule(Self.disconnectDeadline) { [weak self] in
+            current.timer = schedule(Self.disconnectDeadline, allModes: true) { [weak self] in
                 guard let self, self.attempt?.id == current.id else { return }
-                let seconds = Int(Self.disconnectDeadline)
-                self.log("Stopped waiting for the tunnel runner after \(seconds) s.")
-                current.error = [current.error, "OpenConnect did not finish disconnecting within \(seconds) seconds and may still be running. Restarting your Mac clears any leftover VPN network settings."]
-                    .compactMap { $0 }.joined(separator: "\n\n")
-                self.finish(current.id)
+                self.disconnectOverdue(current)
             }
         } else {
             current.listener.cancel()
@@ -401,8 +429,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// The runner has not exited in time. A pending quit stops waiting. Otherwise keep waiting, with
+    /// Connect disabled but Quit available: a late vpnc-script cleanup would undo the routes and DNS
+    /// of a newer session.
+    private func disconnectOverdue(_ current: Attempt) {
+        current.timer = nil
+        let seconds = Int(Self.disconnectDeadline)
+        log("The tunnel runner has not exited \(seconds) s after the disconnect request.")
+        if quitting { finish(current.id); return }
+        current.overdue = true
+        let warning = "OpenConnect is taking more than \(seconds) seconds to disconnect. Connect becomes available again once it finishes; you can still quit. If it never finishes, restarting your Mac clears any leftover VPN network settings."
+        let message = [current.error, warning].compactMap { $0 }.joined(separator: "\n\n")
+        current.error = nil // Shown now; finishing later should not repeat it.
+        alert(message)
+    }
+
     private func finish(_ id: UUID) {
         guard let current = attempt, current.id == id else { return }
+        if current.overdue { log("The old tunnel runner has exited; Connect is available again.") }
         current.timer?.invalidate()
         current.timer = nil
         current.listener.cancel()
@@ -418,9 +462,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func quit() { NSApp.terminate(nil) }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard attempt != nil else { return .terminateNow }
+        // An overdue disconnect has already had its deadline; there is nothing left to wait for.
+        guard let current = attempt, !current.overdue else { return .terminateNow }
         quitting = true
-        DispatchQueue.main.async { self.stop() } // Already stopping: the disconnect deadline still applies.
+        // Deferred so that a synchronous finish() cannot reply before .terminateLater is returned.
+        // If already stopping, the pending disconnect deadline still applies.
+        RunLoop.main.perform(inModes: [.common]) { MainActor.assumeIsolated { self.stop() } }
         return .terminateLater
     }
 }

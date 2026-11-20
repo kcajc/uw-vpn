@@ -10,7 +10,7 @@ xcrun swiftc "${common[@]}" Tests/FakeOpenConnect.swift -o build/tests/fake-open
 build/tests/core
 python3 Tests/integration.py
 if [[ "${1:-}" == --ui ]]; then
-  xcrun swiftc "${common[@]}" -D UI_TEST Sources/Core.swift Sources/IPC.swift Sources/Keychain.swift \
+  xcrun swiftc "${common[@]}" -D UI_TEST -D TESTING Sources/Core.swift Sources/IPC.swift Sources/Keychain.swift \
     Sources/Capture.swift Sources/App.swift Tests/UITests.swift -framework AppKit -framework Security \
     -o build/tests/ui-smoke
   build/tests/ui-smoke

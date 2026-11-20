@@ -5,14 +5,6 @@ import Darwin
 // dialog. It is never installed as a service and never sees the WatIAM password.
 @main
 enum Runner {
-    // Seconds to wait after SIGINT (log off, then vpnc-script) before retrying with SIGHUP, which
-    // skips the network-dependent logoff but still runs vpnc-script to restore routes and DNS.
-    #if TESTING
-    static let logoffGrace = TimeInterval(ProcessInfo.processInfo.environment["UW_VPN_TEST_LOGOFF_GRACE"] ?? "") ?? 20
-    #else
-    static let logoffGrace: TimeInterval = 20
-    #endif
-
     static func main() {
         signal(SIGPIPE, SIG_IGN)
         var channel: Channel?
@@ -83,8 +75,7 @@ enum Runner {
         process.standardInput = input
         process.standardOutput = output
         process.standardError = output
-        let exited = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in exited.signal(); wake() }
+        process.terminationHandler = { _ in wake() }
         try process.run()
         input.fileHandleForReading.closeFile()
         output.fileHandleForWriting.closeFile()
@@ -127,14 +118,10 @@ enum Runner {
             input.fileHandleForWriting.closeFile()
             while true { if case .stop = try channel.receive() { break } }
         } catch { /* EOF, including a crashed app, means disconnect. */ }
-        if process.isRunning {
-            process.interrupt() // Log off, then vpnc-script restores routes/DNS.
-            if exited.wait(timeout: .now() + logoffGrace) == .timedOut {
-                try? channel.send(.log("OpenConnect was still running \(Int(logoffGrace)) s after SIGINT; "
-                                       + "sending SIGHUP to disconnect without logging off."))
-                kill(process.processIdentifier, SIGHUP)
-            }
-        }
+        // Exactly one signal, then wait however long cleanup takes: OpenConnect logs off, then runs
+        // vpnc-script to restore routes and DNS. A second signal can cut short its wait for that
+        // script and leave the network half restored. The app copes with a slow disconnect instead.
+        if process.isRunning { process.interrupt() }
         process.waitUntilExit()
         logs.wait()
         try? channel.send(.exited(process.terminationStatus))

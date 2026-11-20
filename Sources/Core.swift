@@ -106,15 +106,18 @@ struct Session: Codable, Sendable {
 
     init(output: String, config: Config) throws {
         // This is data, never shell code: deliberately do not eval/source OpenConnect's output.
-        var values: [String: String] = [:]
+        var values: [String: String] = [:], seen: Set<String> = []
         let allowed: Set<String> = ["COOKIE", "HOST", "CONNECT_URL", "FINGERPRINT", "RESOLVE"]
         for line in output.split(separator: "\n") {
             guard let equals = line.firstIndex(of: "=") else { continue }
             let key = String(line[..<equals])
             guard allowed.contains(key) else { continue }
-            let quoted = String(line[line.index(after: equals)...])
-            guard quoted.first == "'", quoted.last == "'", quoted.count >= 2,
-                  values[key] == nil else { throw VPNError("Unexpected authentication output.") }
+            guard seen.insert(key).inserted else { throw VPNError("Unexpected authentication output.") }
+            let quoted = line[line.index(after: equals)...]
+            if quoted.isEmpty { continue } // A bare RESOLVE= means OpenConnect has no address to pin.
+            guard quoted.first == "'", quoted.last == "'", quoted.count >= 2 else {
+                throw VPNError("Unexpected authentication output.")
+            }
             values[key] = String(quoted.dropFirst().dropLast())
         }
         guard let cookie = values["COOKIE"], let fingerprint = values["FINGERPRINT"] else {
@@ -128,6 +131,16 @@ struct Session: Codable, Sendable {
         self.resolve = values["RESOLVE"]
         self.reconnectTimeout = config.reconnectTimeout
         try validate()
+    }
+
+    /// Every COOKIE value in OpenConnect's output, quoted or not. Independent of `init(output:)`, so
+    /// the cookie can be redacted from diagnostics even when the rest of the output is rejected.
+    static func cookies(in output: String) -> [String] {
+        output.split(separator: "\n").filter { $0.hasPrefix("COOKIE=") }.map { line in
+            let value = line.dropFirst("COOKIE=".count)
+            let quoted = value.count >= 2 && value.first == "'" && value.last == "'"
+            return String(quoted ? value.dropFirst().dropLast() : value)
+        }.filter { !$0.isEmpty }
     }
 
     func validate() throws {

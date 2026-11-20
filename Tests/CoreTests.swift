@@ -73,6 +73,16 @@ enum Tests {
         let injection = try Session(output: output.replacingOccurrences(of: "test-cookie", with: "$(touch /tmp/NEVER_EXECUTE)"), config: config)
         check(injection.cookie == "$(touch /tmp/NEVER_EXECUTE)", "session output treated as data")
         check(!FileManager.default.fileExists(atPath: "/tmp/NEVER_EXECUTE"), "no shell evaluation")
+        // OpenConnect 9.21 prints a bare RESOLVE= when it has no address to pin; that is not malformed.
+        let unpinned = try Session(output: output.replacingOccurrences(of: "RESOLVE='vpn2.example:192.0.2.1'", with: "RESOLVE="),
+                                   config: config)
+        check(unpinned.resolve == nil && !unpinned.tunnelArguments.contains { $0.hasPrefix("--resolve") },
+              "bare RESOLVE= means no pinned address")
+        rejects("duplicate bare assignment rejected") { _ = try Session(output: output + "RESOLVE=\n", config: config) }
+        let rejected = "COOKIE='leaky-cookie'\nFINGERPRINT='--bad'\n"
+        rejects("malformed session rejected") { _ = try Session(output: rejected, config: config) }
+        check(Session.cookies(in: rejected) == ["leaky-cookie"], "cookie found for redaction when the session is rejected")
+        check(Session.cookies(in: "COOKIE=bare\nCOOKIE='quoted'\nCOOKIE=\n") == ["bare", "quoted"], "every cookie form found for redaction")
 
         // The control-socket wire format is unchanged by the Message enum.
         check(try! json(.exited(7)) == ["kind": "exited", "code": "7"], "exited wire format")

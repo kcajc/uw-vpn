@@ -3,8 +3,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 app="$PWD/build/UW VPN.app"
+rm -rf "$app" # Never ship stale files from an earlier build.
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-common=(-swift-version 5 -O -warnings-as-errors -target arm64-apple-macosx13.0)
+common=(-swift-version 6 -O -warnings-as-errors -target arm64-apple-macosx13.0)
 
 xcrun swiftc "${common[@]}" Sources/Core.swift Sources/IPC.swift Sources/Runner.swift \
   -o "$app/Contents/MacOS/uw-vpn-runner"

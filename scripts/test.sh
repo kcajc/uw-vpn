@@ -2,9 +2,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p build/tests
-common=(-swift-version 5 -parse-as-library -warnings-as-errors)
+common=(-swift-version 6 -parse-as-library -warnings-as-errors)
 xcrun swiftc "${common[@]}" -D TESTING Sources/Core.swift Sources/IPC.swift Tests/CoreTests.swift -o build/tests/core
 xcrun swiftc "${common[@]}" -D TESTING Sources/Core.swift Sources/IPC.swift Sources/Runner.swift -o build/tests/runner
+xcrun swiftc "${common[@]}" Sources/Core.swift Sources/IPC.swift Sources/Runner.swift -o build/tests/release-runner
 xcrun swiftc "${common[@]}" Tests/FakeOpenConnect.swift -o build/tests/fake-openconnect
 build/tests/core
 python3 Tests/integration.py

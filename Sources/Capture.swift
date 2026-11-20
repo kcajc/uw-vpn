@@ -7,14 +7,16 @@ final class Capture: @unchecked Sendable {
     let pipe = Pipe()
     private let finished = DispatchGroup()
     private var data = Data()
+    private static let limit = 65_536
 
     init() {
         finished.enter()
+        let reader = pipe.fileHandleForReading.fileDescriptor
         DispatchQueue.global().async { [self] in
             while true {
-                let chunk = pipe.fileHandleForReading.readData(ofLength: 4096)
+                let chunk = readChunk(reader)
                 if chunk.isEmpty { break }
-                data.append(chunk.prefix(max(0, 65_536 - data.count)))
+                data.append(chunk.prefix(max(0, Self.limit - data.count)))
             }
             finished.leave()
         }

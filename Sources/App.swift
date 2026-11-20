@@ -2,6 +2,22 @@ import AppKit
 import Foundation
 import Darwin
 
+enum ConnectionState: Equatable {
+    case disconnected, authorizing, approvingDuo, connecting, connected, reconnecting, disconnecting
+
+    var title: String {
+        switch self {
+        case .disconnected: "Disconnected"
+        case .authorizing: "Authorizing…"
+        case .approvingDuo: "Approve Duo…"
+        case .connecting: "Connecting…"
+        case .connected: "Connected"
+        case .reconnecting: "Reconnecting…"
+        case .disconnecting: "Disconnecting…"
+        }
+    }
+}
+
 @MainActor
 private final class Attempt {
     let id = UUID()
@@ -10,17 +26,31 @@ private final class Attempt {
     var channel: Channel?
     var authorizer: Process?
     var authenticator: Process?
-    var timeout: Timer?
+    var timer: Timer? // The connection timeout, then the disconnect deadline.
     var stopping = false
+    var overdue = false // Past the disconnect deadline; still waiting for the runner to exit.
     var authenticationStarted = false
-    var error: String?
+    var error: String? // The first failure wins; it is shown when the attempt finishes.
     init(config: Config) throws { self.config = config; listener = try Listener() }
 }
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private static let connectTimeout: TimeInterval = 180
+    // A normal logoff plus vpnc-script run takes a few seconds.
+    #if UI_TEST
+    private static let disconnectDeadline: TimeInterval = 1
+    #else
+    private static let disconnectDeadline: TimeInterval = 45
+    #endif
+    private static let timestamp: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter
+    }()
+
     private var item: NSStatusItem!
-    private var status = "Disconnected"
+    private var state = ConnectionState.disconnected
     private var attempt: Attempt?
     private var diagnostics: [String] = []
     private var quitting = false
@@ -34,21 +64,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     #if UI_TEST
     func verifyMenu() -> Bool {
-        guard let button = item.button, let frame = button.window?.frame,
+        guard let button = item.button, button.image != nil, let frame = button.window?.frame,
               NSScreen.screens.contains(where: { $0.frame.intersects(frame) }),
               item.isVisible, let menu = item.menu else { return false }
         print("Native menu: \(menu.items.map(\.title).filter { !$0.isEmpty }.joined(separator: ", "))")
         return menu.items.contains { $0.title == "Connect" && $0.isEnabled }
     }
+
+    private(set) var alerts: [String] = []
+    var isIdle: Bool { attempt == nil }
+    var hasRunner: Bool { attempt?.channel != nil }
+    var connectEnabled: Bool { item.menu?.items.first { $0.action == #selector(toggle) }?.isEnabled ?? false }
+    var quitEnabled: Bool { item.menu?.items.first { $0.action == #selector(quit) }?.isEnabled ?? false }
+
+    /// Starts an attempt without sudo and returns the "runner" end of its control socket. The test
+    /// decides what the runner does; staying silent simulates a stuck OpenConnect cleanup.
+    func startAttemptWithFakeRunner() throws -> Channel {
+        let current = try Attempt(config: Config())
+        attempt = current
+        setState(.authorizing)
+        waitForRunner(current)
+        return try Channel.connect(path: current.listener.path)
+    }
+    func requestDisconnect() { stop() }
     #endif
 
+    private func setState(_ new: ConnectionState) {
+        state = new
+        refreshMenu()
+    }
+
     private func refreshMenu() {
-        let connected = status == "Connected"
-        let symbol = connected
-            ? "point.3.filled.connected.trianglepath.dotted"
-            : "point.3.connected.trianglepath.dotted"
+        let connected = state == .connected
+        let symbol = connected ? "seal.fill" : "seal"
         let image = NSImage(systemSymbolName: symbol,
-                            accessibilityDescription: "UW VPN — \(status)")?
+                            accessibilityDescription: "UW VPN — \(state.title)")?
             .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 16, weight: .regular)
                 .applying(.preferringMonochrome()))
         image?.isTemplate = true // AppKit supplies the menu bar's contrast and highlight colors.
@@ -57,14 +107,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.button?.imagePosition = .imageOnly
         item.button?.imageScaling = .scaleProportionallyDown
         item.button?.contentTintColor = nil
-        item.button?.toolTip = "UW VPN — \(status)"
+        item.button?.toolTip = "UW VPN — \(state.title)"
         let menu = NSMenu()
         menu.autoenablesItems = false
-        let label = menu.addItem(withTitle: "UW VPN — \(status)", action: nil, keyEquivalent: "")
+        let label = menu.addItem(withTitle: "UW VPN — \(state.title)", action: nil, keyEquivalent: "")
         label.isEnabled = false
         menu.addItem(.separator())
         add(menu, attempt == nil ? "Connect" : (connected ? "Disconnect" : "Cancel / Disconnect"),
-            #selector(toggle), enabled: status != "Disconnecting…")
+            #selector(toggle), enabled: state != .disconnecting)
         menu.addItem(.separator())
         add(menu, "Edit Config…", #selector(editConfig))
         add(menu, "Set Password…", #selector(setPassword), enabled: attempt == nil)
@@ -82,17 +132,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         entry.isEnabled = enabled
     }
 
+    /// Records text verbatim: the app's own messages hold no secrets. Text from OpenConnect,
+    /// sudo or the runner must pass through `sanitized` before it gets here.
     private func log(_ text: String) {
-        diagnostics.append(sanitized(text))
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        diagnostics.append("\(Self.timestamp.string(from: Date())) \(text)")
         if diagnostics.count > 80 { diagnostics.removeFirst(diagnostics.count - 80) }
     }
 
     private func alert(_ message: String) {
+        #if UI_TEST
+        alerts.append(message) // Recorded for the test instead of blocking on a modal alert.
+        #else
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "UW VPN"
         alert.informativeText = message
         alert.runModal()
+        #endif
+    }
+
+    /// A one-shot main-thread timer. `allModes` lets it fire while AppKit runs a modal loop, which it
+    /// does while waiting to quit: a default-mode timer would never fire there, so Quit would hang.
+    /// The body runs directly on the main thread rather than hopping through the main queue, which
+    /// AppKit does not drain while a quit is pending if the quit began inside a main-queue block.
+    private func schedule(_ interval: TimeInterval, allModes: Bool = false,
+                          _ body: @escaping @MainActor () -> Void) -> Timer {
+        let timer = Timer(timeInterval: interval, repeats: false) { _ in MainActor.assumeIsolated(body) }
+        RunLoop.main.add(timer, forMode: allModes ? .common : .default)
+        return timer
     }
 
     private func config() throws -> Config {
@@ -167,14 +236,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                   FileManager.default.isExecutableFile(atPath: Config.vpncScript) else {
                 throw VPNError("Install Homebrew OpenConnect and its vpnc-script first: brew install openconnect")
             }
+            // A tunnel left over from an earlier session (say, one whose disconnect overran and the
+            // app was quit): its late cleanup would undo the new session's routes and DNS.
+            let leftovers = processIDs(named: ["openconnect", "uw-vpn-runner"])
+            guard leftovers.isEmpty else {
+                throw VPNError("An earlier VPN tunnel is still running (process \(leftovers.map(String.init).joined(separator: ", "))). Connect again once it has exited; if it never does, restarting your Mac clears it.")
+            }
             let current = try Attempt(config: config)
             attempt = current
-            status = "Authorizing…"
             diagnostics.removeAll()
+            setState(.authorizing)
             log("Authorizing a per-session tunnel runner. No persistent helper or sudoers rule.")
-            refreshMenu()
-            current.timeout = Timer.scheduledTimer(withTimeInterval: 180, repeats: false) { [weak self] _ in
-                Task { @MainActor in self?.fail(current.id, "Connection timed out. No automatic login retries were made.") }
+            // Default mode only: this must not fire behind the modal password dialog.
+            current.timer = schedule(Self.connectTimeout) { [weak self] in
+                self?.fail(current.id, "Connection timed out. No automatic login retries were made.")
             }
             waitForRunner(current)
             try authorize(current)
@@ -187,35 +262,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func authorize(_ current: Attempt, method: AuthorizationMethod = .touchID) throws {
         let runner = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/uw-vpn-runner").path
         let process = Process(), errors = Capture()
-        let input: Pipe?
         if method == .touchID {
             log("Trying macOS sudo Touch ID authentication.")
             process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
             process.arguments = touchIDArguments(runner: runner, socket: current.listener.path, uid: getuid())
-            process.standardInput = FileHandle.nullDevice
-            input = nil
         } else {
             log("Using the standard macOS administrator dialog as fallback.")
             process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            input = Pipe()
-            process.standardInput = input
+            process.arguments = authorizationArguments(runner: runner, socket: current.listener.path, uid: getuid())
         }
+        process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
         process.standardError = errors.pipe
         current.authorizer = process
         process.terminationHandler = { [weak self] process in
-            let detail = errors.result()
+            let detail = sanitized(errors.result())
             process.terminationHandler = nil
             Task { @MainActor in
                 guard let self, self.attempt?.id == current.id, current.authorizer === process else { return }
+                let status = process.terminationStatus, exited = process.terminationReason == .exit
                 if current.stopping { self.finish(current.id) }
-                else if method.needsPasswordFallback(exitCode: process.terminationStatus,
+                else if method.needsPasswordFallback(status: status, exited: exited,
                                                      runnerStarted: current.channel != nil, cancelled: current.stopping) {
+                    self.log("sudo did not authorize the runner: \(detail.isEmpty ? "exit \(status)" : detail)")
                     do { try self.authorize(current, method: .password) }
                     catch { self.fail(current.id, error.localizedDescription) }
                 }
-                else if process.terminationStatus != 0 {
-                    self.fail(current.id, "Administrator authorization or tunnel runner failed.\n\(sanitized(detail))")
+                else if status != 0 || !exited {
+                    self.fail(current.id, "Administrator authorization or tunnel runner failed.\n\(detail)")
                 }
             }
         }
@@ -227,54 +301,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             throw error
         }
         errors.closeWriter()
-        if let input {
-            input.fileHandleForReading.closeFile()
-            try input.fileHandleForWriting.write(contentsOf:
-                Data(authorizationScript(runner: runner, socket: current.listener.path, uid: getuid()).utf8))
-            input.fileHandleForWriting.closeFile()
-        }
     }
 
     private func waitForRunner(_ current: Attempt) {
+        let id = current.id, listener = current.listener
         DispatchQueue.global().async { [weak self] in
-            do {
-                let channel = try current.listener.acceptRoot()
-                awaitMain { [weak self] in
-                    guard let self, self.attempt?.id == current.id else { channel.shutdown(); return }
-                    current.channel = channel
-                    if current.stopping { try? channel.send(Message(kind: "stop")) }
+            let channel: Channel
+            do { channel = try listener.acceptRoot() }
+            catch {
+                onMain { [weak self] in
+                    guard let self, self.attempt?.id == id, !current.stopping else { return }
+                    self.fail(id, error.localizedDescription)
                 }
+                return
+            }
+            onMain { [weak self] in
+                guard let self, self.attempt?.id == id else { channel.shutdown(); return }
+                current.channel = channel
+            }
+            do {
                 while true {
                     let message = try channel.receive()
-                    awaitMain { [weak self] in self?.handle(message, id: current.id) }
+                    onMain { [weak self] in self?.handle(message, id: id) }
                 }
-            } catch {
-                awaitMain { [weak self] in
-                    guard let self, self.attempt?.id == current.id else { return }
-                    if current.channel != nil {
-                        if !current.stopping { current.error = "Lost the tunnel runner. Check Diagnostics and verify VPN cleanup before reconnecting." }
-                        self.finish(current.id)
-                    }
-                    else if !current.stopping { self.fail(current.id, error.localizedDescription) }
+            } catch where !channel.closed {
+                // A message the app cannot read: stop the tunnel cleanly, but keep the socket until the
+                // runner exits, so Connect stays disabled while OpenConnect cleans up.
+                onMain { [weak self] in self?.fail(id, "Unexpected message from the tunnel runner.") }
+                while !readChunk(channel.fd).isEmpty {}
+            } catch {}
+            // The runner has exited (or this attempt already finished and shut the socket).
+            onMain { [weak self] in
+                guard let self, self.attempt?.id == id else { return }
+                if !current.stopping, current.error == nil {
+                    current.error = "Lost the tunnel runner. Check Diagnostics and verify VPN cleanup before reconnecting."
                 }
+                self.finish(id)
             }
         }
     }
 
     private func handle(_ message: Message, id: UUID) {
         guard let current = attempt, current.id == id else { return }
-        switch message.kind {
-        case "ready":
+        switch message {
+        case .ready:
             if !current.stopping { authenticate(current) }
-        case "log": log(message.text ?? "")
-        case "connected":
-            if !current.stopping { status = "Connected"; current.timeout?.invalidate(); refreshMenu() }
-        case "reconnecting":
-            if !current.stopping { status = "Reconnecting…"; refreshMenu() }
-        case "exited":
-            if !current.stopping { current.error = "The VPN connection ended (OpenConnect exit \(message.code ?? -1)). See Diagnostics." }
+        case .log(let text):
+            log(sanitized(text))
+        case .connected:
+            guard !current.stopping else { return }
+            current.timer?.invalidate()
+            current.timer = nil
+            setState(.connected)
+        case .reconnecting:
+            if !current.stopping { setState(.reconnecting) }
+        case .failed(let text):
+            // The runner exits next; the closed socket then finishes this attempt.
+            let text = sanitized(text)
+            log(text)
+            if current.error == nil { current.error = text }
+        case .exited(let code):
+            if !current.stopping, current.error == nil {
+                current.error = "The VPN connection ended (OpenConnect exit \(code)). See Diagnostics."
+            }
             finish(id)
-        default: fail(id, "Unexpected message from tunnel runner.")
+        case .start, .stop:
+            fail(id, "Unexpected message from the tunnel runner.")
         }
     }
 
@@ -284,32 +376,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             guard let password = try password(current.config) else { stop(); return }
             guard attempt?.id == current.id, !current.stopping else { return }
-            status = "Approve Duo…"
-            refreshMenu()
+            setState(.approvingDuo)
+            let config = current.config
             let process = Process(), input = Pipe(), output = Capture(), errors = Capture()
             process.executableURL = URL(fileURLWithPath: Config.openconnect)
-            process.arguments = current.config.authenticationArguments
+            process.arguments = config.authenticationArguments
             process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C", "LC_ALL": "C"]
             process.standardInput = input
             process.standardOutput = output.pipe
             process.standardError = errors.pipe
             current.authenticator = process
             process.terminationHandler = { [weak self] process in
-                let result = output.result()
-                let detail = sanitized(errors.result(), secrets: [password])
+                let succeeded = process.terminationReason == .exit && process.terminationStatus == 0
+                let stdout = output.result()
+                let session = Result { try Session(output: stdout, config: config) }
+                // Found even when the session is rejected, so stderr can never echo it into Diagnostics.
+                let detail = sanitized(errors.result(), secrets: [password] + Session.cookies(in: stdout))
                 process.terminationHandler = nil
                 Task { @MainActor in
                     guard let self, self.attempt?.id == current.id, !current.stopping else { return }
                     current.authenticator = nil
                     self.log(detail)
                     do {
-                        guard process.terminationStatus == 0 else {
-                            throw VPNError("VPN sign-in failed. Check your password and Duo approval; see Diagnostics. No login retry was made.")
+                        guard succeeded else {
+                            throw VPNError("VPN sign-in failed. Check your password (Set Password…) and Duo approval; see Diagnostics. No login retry was made.")
                         }
-                        let session = try Session(output: result, config: current.config)
-                        try current.channel?.send(Message(kind: "start", session: session))
-                        self.status = "Connecting…"
-                        self.refreshMenu()
+                        guard let channel = current.channel else { throw VPNError("The tunnel runner is not connected.") }
+                        try channel.send(.start(session.get()))
+                        self.setState(.connecting)
                     } catch { self.fail(current.id, error.localizedDescription) }
                 }
             }
@@ -325,52 +419,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func fail(_ id: UUID, _ message: String) {
         guard let current = attempt, current.id == id else { return }
-        current.error = sanitized(message)
+        if current.error == nil { current.error = message }
         stop()
     }
 
     private func stop() {
         guard let current = attempt, !current.stopping else { return }
         current.stopping = true
-        current.timeout?.invalidate()
-        current.timeout = nil
-        status = "Disconnecting…"
-        refreshMenu()
+        current.timer?.invalidate()
+        current.timer = nil
+        setState(.disconnecting)
         if let process = current.authenticator, process.isRunning { process.interrupt() }
-        if let channel = current.channel { try? channel.send(Message(kind: "stop")) }
-        else {
+        if let channel = current.channel {
+            try? channel.send(.stop)
+            current.timer = schedule(Self.disconnectDeadline, allModes: true) { [weak self] in
+                guard let self, self.attempt?.id == current.id else { return }
+                self.disconnectOverdue(current)
+            }
+        } else {
             current.listener.cancel()
             if let process = current.authorizer, process.isRunning { process.terminate() }
             finish(current.id) // No session cookie was handed off; no tunnel can have started.
         }
     }
 
+    /// The runner has not exited in time. A pending quit stops waiting. Otherwise keep waiting, with
+    /// Connect disabled but Quit available: a late vpnc-script cleanup would undo the routes and DNS
+    /// of a newer session.
+    private func disconnectOverdue(_ current: Attempt) {
+        current.timer = nil
+        let seconds = Int(Self.disconnectDeadline)
+        log("The tunnel runner has not exited \(seconds) s after the disconnect request.")
+        if quitting { finish(current.id); return }
+        current.overdue = true
+        let warning = "OpenConnect is taking more than \(seconds) seconds to disconnect. Connect becomes available again once it finishes; you can still quit. If it never finishes, restarting your Mac clears any leftover VPN network settings."
+        let message = [current.error, warning].compactMap { $0 }.joined(separator: "\n\n")
+        current.error = nil // Shown now; finishing later should not repeat it.
+        alert(message)
+    }
+
     private func finish(_ id: UUID) {
         guard let current = attempt, current.id == id else { return }
-        current.timeout?.invalidate()
-        current.timeout = nil
+        if current.overdue { log("The old tunnel runner has exited; Connect is available again.") }
+        current.timer?.invalidate()
+        current.timer = nil
         current.listener.cancel()
         current.channel?.shutdown()
         if let process = current.authenticator, process.isRunning { process.interrupt() }
         current.authorizer?.terminationHandler = nil
         current.authenticator?.terminationHandler = nil
         attempt = nil
-        status = "Disconnected"
-        refreshMenu()
+        setState(.disconnected)
         if quitting { NSApp.reply(toApplicationShouldTerminate: true) }
         else if let error = current.error { log(error); alert(error) }
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard attempt != nil else { return .terminateNow }
+        // An overdue disconnect has already had its deadline; there is nothing left to wait for.
+        guard let current = attempt, !current.overdue else { return .terminateNow }
         quitting = true
-        DispatchQueue.main.async { self.stop() }
+        // Deferred so that a synchronous finish() cannot reply before .terminateLater is returned.
+        // If already stopping, the pending disconnect deadline still applies.
+        RunLoop.main.perform(inModes: [.common]) { MainActor.assumeIsolated { self.stop() } }
         return .terminateLater
     }
 }
 
-private func awaitMain(_ body: @escaping @MainActor () -> Void) {
+/// Schedules `body` on the main actor without blocking the calling thread.
+private func onMain(_ body: @escaping @MainActor () -> Void) {
     DispatchQueue.main.async { body() }
 }
 

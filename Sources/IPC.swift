@@ -7,6 +7,9 @@ import Darwin
 // wakes that loop; the descriptor is closed only when its last owner releases it.
 final class Channel: @unchecked Sendable {
     let fd: Int32
+    /// Set by the receive loop when the peer hung up or this end was shut down, as opposed to a
+    /// message that could not be read. Read it only from the receiving thread.
+    private(set) var closed = false
     private var buffer = Data()
     private let writeLock = NSLock()
 
@@ -55,11 +58,9 @@ final class Channel: @unchecked Sendable {
                 return message
             }
             guard buffer.count < 131_072 else { throw VPNError("Control message too large.") }
-            var bytes = [UInt8](repeating: 0, count: 4096)
-            let count = Darwin.read(fd, &bytes, bytes.count)
-            if count < 0 && errno == EINTR { continue }
-            guard count > 0 else { throw VPNError("Control connection closed.") }
-            buffer.append(contentsOf: bytes.prefix(count))
+            let chunk = readChunk(fd)
+            guard !chunk.isEmpty else { closed = true; throw VPNError("Control connection closed.") }
+            buffer.append(chunk)
         }
     }
 
@@ -69,6 +70,18 @@ final class Channel: @unchecked Sendable {
         let result = try withAddress(path) { Darwin.connect(channel.fd, $0, $1) }
         guard result == 0 else { throw VPNError("Cannot connect to the app's control socket.") }
         return channel
+    }
+}
+
+/// One read(2): whatever is available, up to `limit` bytes; empty at EOF or on error. Unlike
+/// FileHandle's non-throwing reads, this never raises an Objective-C exception (a crash in the
+/// root runner would orphan OpenConnect).
+func readChunk(_ fd: Int32, limit: Int = 4096) -> Data {
+    var bytes = [UInt8](repeating: 0, count: limit)
+    while true {
+        let count = Darwin.read(fd, &bytes, limit)
+        if count < 0 && errno == EINTR { continue }
+        return count > 0 ? Data(bytes.prefix(count)) : Data()
     }
 }
 

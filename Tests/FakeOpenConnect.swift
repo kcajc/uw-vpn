@@ -3,25 +3,44 @@ import Darwin
 
 @main
 enum FakeOpenConnect {
+    nonisolated(unsafe) static var cleaning = false
+
     static func main() {
         guard let cookie = readLine(), cookie.hasPrefix("test-cookie-"),
               !CommandLine.arguments.contains(where: { $0.contains(cookie) }),
               CommandLine.arguments.contains("--cookie-on-stdin"),
               CommandLine.arguments.contains("--script=/opt/homebrew/etc/vpnc/vpnc-script") else { exit(90) }
-        signal(SIGINT, SIG_IGN)
-        signal(SIGTERM, SIG_IGN)
-        let source = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-        source.setEventHandler {
-            print("mock route and DNS cleanup")
-            fflush(stdout)
-            exit(0)
+        // Like OpenConnect, any of these starts logoff + vpnc-script cleanup. "test-cookie-slow"
+        // makes that cleanup take a while; a second signal during it would cut it short, so the
+        // fake reports that instead of finishing cleanly.
+        let delay: TimeInterval = cookie == "test-cookie-slow" ? 1.5 : 0
+        var sources: [DispatchSourceSignal] = []
+        for number in [SIGINT, SIGTERM, SIGHUP] {
+            signal(number, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
+            source.setEventHandler {
+                if cleaning { print("mock cleanup interrupted by signal \(number)"); fflush(stdout); exit(3) }
+                cleaning = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                    print("mock route and DNS cleanup")
+                    fflush(stdout)
+                    exit(0)
+                }
+            }
+            source.resume()
+            sources.append(source)
         }
-        source.resume()
         print("mock pid: \(getpid())")
         print("Configured as 192.0.2.2, with SSL connected")
+        // Informational only; it must not be mistaken for a reconnect.
+        print("Server reports that reconnect-after-drop is allowed within 3600 seconds, idle timeout 1800")
+        if cookie == "test-cookie-drop" {
+            print("CSTP Dead Peer Detection detected dead peer!")
+            print("CSTP connected. DPD 30, Keepalive 20")
+        }
         print("cookie=\(cookie)") // Intentionally test secret filtering.
         fflush(stdout)
         if cookie == "test-cookie-exit" { exit(7) }
-        withExtendedLifetime(source) { dispatchMain() }
+        withExtendedLifetime(sources) { dispatchMain() }
     }
 }

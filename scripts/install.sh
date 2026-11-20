@@ -1,7 +1,19 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+if pgrep -qx -u "$(id -u)" "UW VPN"; then
+  echo "Quit UW VPN before installing." >&2
+  exit 1
+fi
 ./scripts/build.sh
+dest="$HOME/Applications/UW VPN.app"
+staged="$HOME/Applications/.UW VPN.app.installing" # Same volume, so the final mv is a rename.
 mkdir -p "$HOME/Applications"
-/usr/bin/ditto "build/UW VPN.app" "$HOME/Applications/UW VPN.app"
-printf 'Installed: %s/Applications/UW VPN.app\n' "$HOME"
+rm -rf "$staged"
+trap 'rm -rf "$staged"' EXIT # Gone after a successful mv; removes a partial copy otherwise.
+/usr/bin/ditto "build/UW VPN.app" "$staged"
+/usr/bin/codesign --verify --deep --strict "$staged"
+# Only now replace (never merge into) the working app; an interrupted copy leaves it untouched.
+rm -rf "$dest"
+mv "$staged" "$dest"
+printf 'Installed: %s\n' "$dest"

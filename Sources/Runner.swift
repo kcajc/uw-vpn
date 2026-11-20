@@ -1,21 +1,33 @@
 import Foundation
 import Darwin
 
-// A per-session root process, launched through the normal macOS authorization
+// A per-session root process, launched through sudo (Touch ID) or the macOS administrator
 // dialog. It is never installed as a service and never sees the WatIAM password.
 @main
 enum Runner {
+    // OpenConnect 9.21's messages for a dropped TLS (CSTP) connection it is re-establishing. Lines
+    // that merely mention reconnection ("reconnect-after-drop is allowed…") must not match, and
+    // DTLS-only trouble is left out: OpenConnect falls back to TLS and stays connected.
+    static let reconnectMarkers = ["CSTP Dead Peer Detection detected dead peer!",
+                                   "TCP Dead Peer Detection detected dead peer!", "Detected dead peer!",
+                                   "CSTP reconnect failed", "Reconnect failed", "Failed to reconnect to host",
+                                   "User requested reconnect"]
+
     static func main() {
         signal(SIGPIPE, SIG_IGN)
-        do { try run() }
+        var channel: Channel?
+        do { try run(connecting: &channel) }
         catch {
-            // Startup failures contain no session data. The app reads this stderr.
-            fputs("UW VPN: \(error.localizedDescription)\n", stderr)
-            exit(1)
+            // Failures contain no session data. The app shows them from the socket once it is
+            // connected, or from this stderr if the runner never got that far.
+            let text = "Tunnel runner: \(error.localizedDescription)"
+            try? channel?.send(.failed(text))
+            fputs(text + "\n", stderr)
+            exit(runnerFailureStatus)
         }
     }
 
-    static func run() throws {
+    static func run(connecting connected: inout Channel?) throws {
         #if !TESTING
         guard geteuid() == 0 else { throw VPNError("The tunnel runner requires administrator authorization.") }
         #endif
@@ -30,13 +42,30 @@ enum Runner {
         }
         let channel = try Channel.connect(path: path)
         try channel.checkPeer(uid: uid)
-        try channel.send(Message(kind: "ready"))
-        let start = try channel.receive()
-        if start.kind == "stop" { try channel.send(Message(kind: "exited", code: 0)); return }
-        guard start.kind == "start", let session = start.session else {
-            throw VPNError("Expected an authenticated session.")
+        connected = channel
+        try channel.send(.ready)
+        let session: Session
+        switch try channel.receive() {
+        case .stop: try channel.send(.exited(0)); return
+        case .start(let value): session = value
+        default: throw VPNError("Expected an authenticated session.")
         }
         try session.validate()
+
+        // Every shutdown cause (signal, app request, lost app, OpenConnect exiting) ends the
+        // receive loop below and takes the same cleanup path.
+        let wake: @Sendable () -> Void = { _ = Darwin.shutdown(channel.fd, SHUT_RD) }
+        // Installed before OpenConnect exists, so no signal can orphan it. A no-op handler rather
+        // than SIG_IGN: ignored signals stay ignored across exec, handled ones reset to default.
+        var signalSources: [DispatchSourceSignal] = []
+        for number in [SIGTERM, SIGINT, SIGHUP, SIGQUIT] {
+            signal(number) { _ in }
+            let source = DispatchSource.makeSignalSource(signal: number, queue: .global())
+            source.setEventHandler(handler: wake)
+            source.resume()
+            signalSources.append(source)
+        }
+        defer { signalSources.forEach { $0.cancel() } }
 
         let process = Process()
         #if TESTING
@@ -54,24 +83,14 @@ enum Runner {
         process.standardInput = input
         process.standardOutput = output
         process.standardError = output
-        process.terminationHandler = { _ in _ = Darwin.shutdown(channel.fd, SHUT_RD) }
+        process.terminationHandler = { _ in wake() }
         try process.run()
         input.fileHandleForReading.closeFile()
         output.fileHandleForWriting.closeFile()
 
-        // Root signals and a lost GUI connection both take the same cleanup path.
-        var signalSources: [DispatchSourceSignal] = []
-        for number in [SIGTERM, SIGINT] {
-            signal(number, SIG_IGN)
-            let source = DispatchSource.makeSignalSource(signal: number, queue: .global())
-            source.setEventHandler { _ = Darwin.shutdown(channel.fd, SHUT_RD) }
-            source.resume()
-            signalSources.append(source)
-        }
-        defer { signalSources.forEach { $0.cancel() } }
-
         let logs = DispatchGroup()
         logs.enter()
+        let reader = output.fileHandleForReading.fileDescriptor
         DispatchQueue.global().async {
             var pending = Data()
             var hasConnected = false
@@ -79,17 +98,17 @@ enum Runner {
                 let line = sanitized(String(decoding: data, as: UTF8.self), secrets: [session.cookie])
                 guard !line.isEmpty else { return }
                 do {
-                    try channel.send(Message(kind: "log", text: line))
+                    try channel.send(.log(line))
                     if line.contains("Configured as ") || (hasConnected && line.contains("CSTP connected.")) {
                         hasConnected = true
-                        try channel.send(Message(kind: "connected"))
-                    } else if hasConnected && line.lowercased().contains("reconnect") {
-                        try channel.send(Message(kind: "reconnecting"))
+                        try channel.send(.connected)
+                    } else if hasConnected && reconnectMarkers.contains(where: { line.contains($0) }) {
+                        try channel.send(.reconnecting)
                     }
-                } catch { _ = Darwin.shutdown(channel.fd, SHUT_RD) }
+                } catch { wake() }
             }
             while true {
-                let data = output.fileHandleForReading.availableData
+                let data = readChunk(reader)
                 if data.isEmpty { break }
                 pending.append(data)
                 while let newline = pending.firstIndex(of: 10) {
@@ -105,11 +124,14 @@ enum Runner {
         do {
             try input.fileHandleForWriting.write(contentsOf: Data((session.cookie + "\n").utf8))
             input.fileHandleForWriting.closeFile()
-            while try channel.receive().kind != "stop" {}
+            while true { if case .stop = try channel.receive() { break } }
         } catch { /* EOF, including a crashed app, means disconnect. */ }
+        // Exactly one signal, then wait however long cleanup takes: OpenConnect logs off, then runs
+        // vpnc-script to restore routes and DNS. A second signal can cut short its wait for that
+        // script and leave the network half restored. The app copes with a slow disconnect instead.
         if process.isRunning { process.interrupt() }
-        process.waitUntilExit() // OpenConnect runs vpnc-script to restore routes/DNS.
+        process.waitUntilExit()
         logs.wait()
-        try? channel.send(Message(kind: "exited", code: process.terminationStatus))
+        try? channel.send(.exited(process.terminationStatus))
     }
 }

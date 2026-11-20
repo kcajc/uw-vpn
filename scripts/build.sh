@@ -3,6 +3,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 app="$PWD/build/UW VPN.app"
+# A running build/ copy (app or root runner) would lose its runner mid-build. Prefix match on the
+# command line, so neither sudo's arguments nor this awk itself count.
+if ps -axo command= | awk -v p="$app/Contents/MacOS/" 'index($0, p) == 1 { found = 1 } END { exit !found }'; then
+  echo "Quit the UW VPN running from build/ before rebuilding." >&2
+  exit 1
+fi
 rm -rf "$app" # Never ship stale files from an earlier build.
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 common=(-swift-version 6 -O -warnings-as-errors -target arm64-apple-macosx13.0)

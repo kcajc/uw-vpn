@@ -5,6 +5,14 @@ import Darwin
 // dialog. It is never installed as a service and never sees the WatIAM password.
 @main
 enum Runner {
+    // OpenConnect 9.21's messages for a dropped TLS (CSTP) connection it is re-establishing. Lines
+    // that merely mention reconnection ("reconnect-after-drop is allowed…") must not match, and
+    // DTLS-only trouble is left out: OpenConnect falls back to TLS and stays connected.
+    static let reconnectMarkers = ["CSTP Dead Peer Detection detected dead peer!",
+                                   "TCP Dead Peer Detection detected dead peer!", "Detected dead peer!",
+                                   "CSTP reconnect failed", "Reconnect failed", "Failed to reconnect to host",
+                                   "User requested reconnect"]
+
     static func main() {
         signal(SIGPIPE, SIG_IGN)
         var channel: Channel?
@@ -94,7 +102,7 @@ enum Runner {
                     if line.contains("Configured as ") || (hasConnected && line.contains("CSTP connected.")) {
                         hasConnected = true
                         try channel.send(.connected)
-                    } else if hasConnected && line.lowercased().contains("reconnect") {
+                    } else if hasConnected && reconnectMarkers.contains(where: { line.contains($0) }) {
                         try channel.send(.reconnecting)
                     }
                 } catch { wake() }

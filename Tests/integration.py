@@ -16,7 +16,7 @@ checks = 0
 
 
 def run_case(name, *, drop=False, early_stop=False, natural_exit=False, malformed=False,
-             signal_runner=None, slow=False):
+             signal_runner=None, slow=False, dead_peer=False):
     global checks
     with tempfile.TemporaryDirectory(prefix="uw-vpn-test.", dir="/tmp") as directory:
         path = str(Path(directory) / "control")
@@ -45,7 +45,7 @@ def run_case(name, *, drop=False, early_stop=False, natural_exit=False, malforme
                     assert receive() == {"kind": "exited", "code": 0}
                 else:
                     cookie = ("test-cookie-exit" if natural_exit else
-                              "test-cookie-slow" if slow else "test-cookie-secret")
+                              "test-cookie-slow" if slow else "test-cookie-drop" if dead_peer else "test-cookie-secret")
                     send({"kind": "start", "session": {
                         "cookie": cookie, "server": "http://bad.example" if malformed else "https://vpn.example",
                         "fingerprint": "pin-sha256:abcDEF123+/=", "resolve": "vpn.example:192.0.2.1",
@@ -89,6 +89,13 @@ def run_case(name, *, drop=False, early_stop=False, natural_exit=False, malforme
                             assert messages[-1] == {"kind": "exited", "code": expected}, messages
                             texts = [m.get("text", "") for m in messages]
                             assert not any("interrupted" in t for t in texts), messages
+                            kinds = [m["kind"] for m in messages]
+                            if dead_peer:
+                                after = kinds[kinds.index("connected") + 1:]
+                                assert "reconnecting" in after, messages
+                                assert "connected" in after[after.index("reconnecting"):], messages
+                            else:
+                                assert "reconnecting" not in kinds, messages
                             if not natural_exit:
                                 assert any("mock route and DNS cleanup" in t for t in texts), messages
                             assert cookie not in json.dumps(messages), "cookie leaked to diagnostics"
@@ -125,6 +132,7 @@ run_case("malformed session refused and reported over the socket", malformed=Tru
 run_case("SIGHUP to the runner tears down tunnel", signal_runner=signal.SIGHUP)
 run_case("SIGQUIT to the runner tears down tunnel", signal_runner=signal.SIGQUIT)
 run_case("slow cleanup runs to completion; no second signal", slow=True)
+run_case("dropped connection reports reconnecting, then connected", dead_peer=True)
 
 release = ROOT / "build/tests/release-runner"
 refused = subprocess.run([str(release), "/tmp/unused", str(os.getuid())], capture_output=True, text=True)

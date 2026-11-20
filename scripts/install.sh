@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-if pgrep -qx "UW VPN"; then
+if pgrep -qx -u "$(id -u)" "UW VPN"; then
   echo "Quit UW VPN before installing." >&2
   exit 1
 fi

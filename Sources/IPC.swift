@@ -7,6 +7,9 @@ import Darwin
 // wakes that loop; the descriptor is closed only when its last owner releases it.
 final class Channel: @unchecked Sendable {
     let fd: Int32
+    /// Set by the receive loop when the peer hung up or this end was shut down, as opposed to a
+    /// message that could not be read. Read it only from the receiving thread.
+    private(set) var closed = false
     private var buffer = Data()
     private let writeLock = NSLock()
 
@@ -56,7 +59,7 @@ final class Channel: @unchecked Sendable {
             }
             guard buffer.count < 131_072 else { throw VPNError("Control message too large.") }
             let chunk = readChunk(fd)
-            guard !chunk.isEmpty else { throw VPNError("Control connection closed.") }
+            guard !chunk.isEmpty else { closed = true; throw VPNError("Control connection closed.") }
             buffer.append(chunk)
         }
     }

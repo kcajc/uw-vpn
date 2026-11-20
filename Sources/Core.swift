@@ -218,22 +218,50 @@ extension Message: Codable {
     }
 }
 
+private let credentialKeyword = #"(?i)cookie|authorization|passw(?:or)?d|token|secret"#
 // Keeps a label such as "Cookie:" or "password=" readable and drops everything after it.
 private let credentialPattern =
     #"(?i)((?:cookie|authorization|passw(?:or)?d|token|secret)[A-Za-z0-9_-]*\s*[:=]\s*)\S.*"#
+// The body of an element whose tag names a credential, e.g. <session-token>…</session-token>.
+private let credentialElementPattern =
+    #"(?i)(<[^<>]*(?:cookie|authorization|passw(?:or)?d|token|secret)[^<>]*>)[^<]+"#
+// A value="…" attribute; redacted on lines that name a credential, e.g. <input name="password" value="…">.
+private let valueAttributePattern = #"(?i)(\bvalue\s*=\s*)("[^"]*"|'[^']*'|[^\s>]+)"#
 
 /// Redacts text produced by OpenConnect, sudo or the runner before it is shown or stored.
 /// Do not pass the app's own messages through this: they hold no secrets, and redaction would
 /// only hide them.
 func sanitized(_ text: String, secrets: [String] = []) -> String {
     var result = text
-    for secret in secrets where !secret.isEmpty {
+    // Longest first: replacing a secret that occurs inside a longer one would break the longer match.
+    for secret in secrets.sorted(by: { $0.count > $1.count }) where !secret.isEmpty {
         result = result.replacingOccurrences(of: secret, with: "[redacted]")
     }
     return result.split(separator: "\n").map { line in
-        String(String(line).replacingOccurrences(of: credentialPattern, with: "$1[redacted]",
-                                                 options: .regularExpression).prefix(2000))
+        var line = String(line)
+            .replacingOccurrences(of: credentialPattern, with: "$1[redacted]", options: .regularExpression)
+            .replacingOccurrences(of: credentialElementPattern, with: "$1[redacted]", options: .regularExpression)
+        if line.range(of: credentialKeyword, options: .regularExpression) != nil {
+            line = line.replacingOccurrences(of: valueAttributePattern, with: "$1[redacted]", options: .regularExpression)
+        }
+        return String(line.prefix(2000))
     }.joined(separator: "\n")
+}
+
+/// IDs of every process, including root's, whose name is in `names`. Uses the same kernel list as
+/// ps(1); libproc cannot name other users' processes.
+func processIDs(named names: Set<String>) -> [pid_t] {
+    var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL]
+    var size = 0
+    guard sysctl(&mib, 3, nil, &size, nil, 0) == 0 else { return [] }
+    var procs = [kinfo_proc](repeating: kinfo_proc(), count: size / MemoryLayout<kinfo_proc>.stride + 32)
+    size = procs.count * MemoryLayout<kinfo_proc>.stride
+    guard sysctl(&mib, 3, &procs, &size, nil, 0) == 0 else { return [] }
+    return procs.prefix(size / MemoryLayout<kinfo_proc>.stride).compactMap { proc in
+        var info = proc.kp_proc
+        let name = withUnsafeBytes(of: &info.p_comm) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+        return names.contains(name) ? info.p_pid : nil
+    }
 }
 
 /// The runner's exit status for its own errors. sudo exits 1 when it refuses to authorize, so the

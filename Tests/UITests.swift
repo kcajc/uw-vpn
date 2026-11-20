@@ -50,7 +50,31 @@ enum UITests {
                 runner = try delegate.startAttemptWithFakeRunner()
             }),
             (0.5, {
-                guard delegate.hasRunner else { fail("second fake runner never connected") }
+                guard let runner, delegate.hasRunner else { fail("fake runner never connected") }
+                let garbage = Array("not a control message\n".utf8)
+                _ = Darwin.write(runner.fd, garbage, garbage.count)
+            }),
+            (0.4, {
+                // Well inside the 1 s deadline: the app must be stopping, not finished.
+                guard let runner, !delegate.isIdle, !delegate.connectEnabled else {
+                    fail("an unreadable message must not re-enable Connect while the runner is alive")
+                }
+                var ready = pollfd(fd: runner.fd, events: Int16(POLLIN), revents: 0)
+                guard poll(&ready, 1, 0) == 1, case .stop = try runner.receive() else {
+                    fail("an unreadable message must make the app ask the runner to stop")
+                }
+                runner.shutdown() // The runner finishes cleaning up and exits.
+            }),
+            (0.4, {
+                guard delegate.isIdle, delegate.connectEnabled,
+                      delegate.alerts.last?.contains("Unexpected message") == true else {
+                    fail("Connect must return once the runner exits, with the protocol error shown; got \(delegate.alerts)")
+                }
+                pass("An unreadable runner message stops the tunnel and waits for the runner to exit.")
+                runner = try delegate.startAttemptWithFakeRunner()
+            }),
+            (0.5, {
+                guard delegate.hasRunner else { fail("fake runner for the quit test never connected") }
                 NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
                                                        object: nil, queue: nil) { _ in
                     pass("Quit with a silent tunnel runner exits after the disconnect deadline.")

@@ -102,6 +102,18 @@ enum Tests {
         check(sanitized("webvpn_cookie=abc") == "webvpn_cookie=[redacted]", "prefixed credential key redacted")
         check(sanitized("Failed to obtain WebVPN cookie") == "Failed to obtain WebVPN cookie", "cookie diagnostic kept")
         check(sanitized("sudo: a password is required") == "sudo: a password is required", "sudo diagnostic kept")
+        check(sanitized("<session-token>abc123</session-token>") == "<session-token>[redacted]</session-token>",
+              "credential element body redacted")
+        check(!sanitized(#"<input type="password" name="password" value="p&amp;ss">"#).contains("p&amp;ss"),
+              "escaped password in a form value redacted")
+        check(sanitized(#"<input name="username" value="bob">"#) == #"<input name="username" value="bob">"#,
+              "non-credential form value kept")
+        check(sanitized("xx-abcdef-xx", secrets: ["cd", "abcdef"]) == "xx-[redacted]-xx",
+              "a secret inside a longer secret cannot break the longer one's redaction")
+
+        check(processIDs(named: ["launchd"]).contains(1), "process lookup sees root processes")
+        check(processIDs(named: [ProcessInfo.processInfo.processName]).contains(getpid()), "process lookup sees this process")
+        check(processIDs(named: ["no-such-process-name"]).isEmpty, "process lookup matches exact names")
 
         let arguments = authorizationArguments(runner: "/path with 'quotes'/runner", socket: "/tmp/control", uid: 501)
         check(!arguments.joined().contains(session.cookie), "authorization arguments contain no credentials")

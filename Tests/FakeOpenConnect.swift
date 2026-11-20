@@ -32,6 +32,12 @@ enum FakeOpenConnect {
         }
         print("mock pid: \(getpid())")
         print("Configured as 192.0.2.2, with SSL connected")
+        // Informational only; it must not be mistaken for a reconnect.
+        print("Server reports that reconnect-after-drop is allowed within 3600 seconds, idle timeout 1800")
+        if cookie == "test-cookie-drop" {
+            print("CSTP Dead Peer Detection detected dead peer!")
+            print("CSTP connected. DPD 30, Keepalive 20")
+        }
         print("cookie=\(cookie)") // Intentionally test secret filtering.
         fflush(stdout)
         if cookie == "test-cookie-exit" { exit(7) }

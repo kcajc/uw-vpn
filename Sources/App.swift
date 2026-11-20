@@ -64,7 +64,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     #if UI_TEST
     func verifyMenu() -> Bool {
-        guard let button = item.button, let frame = button.window?.frame,
+        guard let button = item.button, button.image != nil, let frame = button.window?.frame,
               NSScreen.screens.contains(where: { $0.frame.intersects(frame) }),
               item.isVisible, let menu = item.menu else { return false }
         print("Native menu: \(menu.items.map(\.title).filter { !$0.isEmpty }.joined(separator: ", "))")
@@ -96,9 +96,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func refreshMenu() {
         let connected = state == .connected
-        let symbol = connected
-            ? "point.3.filled.connected.trianglepath.dotted"
-            : "point.3.connected.trianglepath.dotted"
+        let symbol = connected ? "seal.fill" : "seal"
         let image = NSImage(systemSymbolName: symbol,
                             accessibilityDescription: "UW VPN — \(state.title)")?
             .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 16, weight: .regular)
@@ -238,6 +236,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                   FileManager.default.isExecutableFile(atPath: Config.vpncScript) else {
                 throw VPNError("Install Homebrew OpenConnect and its vpnc-script first: brew install openconnect")
             }
+            // A tunnel left over from an earlier session (say, one whose disconnect overran and the
+            // app was quit): its late cleanup would undo the new session's routes and DNS.
+            let leftovers = processIDs(named: ["openconnect", "uw-vpn-runner"])
+            guard leftovers.isEmpty else {
+                throw VPNError("An earlier VPN tunnel is still running (process \(leftovers.map(String.init).joined(separator: ", "))). Connect again once it has exited; if it never does, restarting your Mac clears it.")
+            }
             let current = try Attempt(config: config)
             attempt = current
             diagnostics.removeAll()
@@ -302,27 +306,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func waitForRunner(_ current: Attempt) {
         let id = current.id, listener = current.listener
         DispatchQueue.global().async { [weak self] in
-            do {
-                let channel = try listener.acceptRoot()
+            let channel: Channel
+            do { channel = try listener.acceptRoot() }
+            catch {
                 onMain { [weak self] in
-                    guard let self, self.attempt?.id == id else { channel.shutdown(); return }
-                    current.channel = channel
+                    guard let self, self.attempt?.id == id, !current.stopping else { return }
+                    self.fail(id, error.localizedDescription)
                 }
+                return
+            }
+            onMain { [weak self] in
+                guard let self, self.attempt?.id == id else { channel.shutdown(); return }
+                current.channel = channel
+            }
+            do {
                 while true {
                     let message = try channel.receive()
                     onMain { [weak self] in self?.handle(message, id: id) }
                 }
-            } catch {
-                onMain { [weak self] in
-                    guard let self, self.attempt?.id == id else { return }
-                    if current.channel != nil {
-                        if !current.stopping, current.error == nil {
-                            current.error = "Lost the tunnel runner. Check Diagnostics and verify VPN cleanup before reconnecting."
-                        }
-                        self.finish(id)
-                    }
-                    else if !current.stopping { self.fail(id, error.localizedDescription) }
+            } catch where !channel.closed {
+                // A message the app cannot read: stop the tunnel cleanly, but keep the socket until the
+                // runner exits, so Connect stays disabled while OpenConnect cleans up.
+                onMain { [weak self] in self?.fail(id, "Unexpected message from the tunnel runner.") }
+                while !readChunk(channel.fd).isEmpty {}
+            } catch {}
+            // The runner has exited (or this attempt already finished and shut the socket).
+            onMain { [weak self] in
+                guard let self, self.attempt?.id == id else { return }
+                if !current.stopping, current.error == nil {
+                    current.error = "Lost the tunnel runner. Check Diagnostics and verify VPN cleanup before reconnecting."
                 }
+                self.finish(id)
             }
         }
     }
